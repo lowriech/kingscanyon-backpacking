@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dev-server.log
+preview.log
+__pycache__/
+*.local
+.DS_Store
+.venv/
+.duckdb/
+data/

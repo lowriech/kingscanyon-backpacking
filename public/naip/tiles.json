@@ -1,0 +1,18 @@
+{
+  "tiles": [
+    "naip/naip_0_0.tif",
+    "naip/naip_0_1.tif",
+    "naip/naip_0_2.tif",
+    "naip/naip_1_0.tif",
+    "naip/naip_1_1.tif",
+    "naip/naip_1_2.tif",
+    "naip/naip_2_0.tif",
+    "naip/naip_2_1.tif",
+    "naip/naip_2_2.tif",
+    "naip/naip_3_0.tif",
+    "naip/naip_3_1.tif",
+    "naip/naip_3_2.tif"
+  ],
+  "crs": "EPSG:3857",
+  "mpp": 1.25
+}
