@@ -12,7 +12,7 @@ This is the canonical domain for all fetched map data:
 | South (min lat) | `36.2682` |
 | West (min lon) | `-118.8288` |
 | North (max lat) | `36.7708` |
-| East (max lon) | `-118.2699` |
+| East (max lon) | `-118.2699` | 
 
 Corners (lat, lon): `36.2682, -118.8288` (SW) → `36.7708, -118.2699` (NE).
 
