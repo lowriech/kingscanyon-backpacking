@@ -11,6 +11,7 @@ import {
 import { MINERAL_KING, RANGER_STATION } from "./mineralKing";
 import { projectBoundsPolygon } from "./projectBounds";
 import ElevationProfile, { type TrailSelection } from "./ElevationProfile";
+import { mergedPulseLine } from "./trailChain";
 
 // Stream the locally-baked NAIP Cloud-Optimized GeoTIFFs tile-by-tile straight
 // from public/naip/ (see scripts/bake_naip.py) via the cog:// protocol. The
@@ -54,6 +55,72 @@ const TRAIL_COLOR = "#ff8a3d";
 const HOVER_COLOR = "#ffe08a";
 const SELECT_COLOR = "#ff2e63";
 
+// Direction pulse ("marching ants" with a soft fade) drawn over the selected
+// trails. The pulse is one periodic, phase-advancing line-gradient running the
+// full length of the chained selection, so its travel direction reads as the
+// trail direction. All distances are in meters and converted to line-progress
+// fractions against the selection's total ground length at animation time.
+const PULSE_SPACING_M = 250; // ground distance between successive ants
+const PULSE_WIDTH_M = 120; // lit length of each ant
+const PULSE_FADE_M = 60; // soft ramp on each side of an ant
+const PULSE_SPEED = 0.6; // periods advanced per second
+// line-gradient bakes to a 256-texel ramp under linear interpolation, so the
+// number of simultaneous soft ants is capped; beyond this, spacing widens.
+const PULSE_MAX_ANTS = 30;
+const PULSE_BASE = "rgba(255,255,255,0)";
+const PULSE_PEAK = "rgba(255,255,255,0.9)";
+
+const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
+
+const EMPTY_FC: GeoJSON.FeatureCollection = {
+  type: "FeatureCollection",
+  features: [],
+};
+
+// Build the periodic soft-ant line-gradient for the current phase. `L` is the
+// selection's total length in meters; `phase` is in [0,1) and shifts every ant.
+// MapLibre requires interpolate stop inputs to be strictly ascending in [0,1],
+// so stops are clamped, sorted, and de-duplicated (any non-increasing input is
+// dropped), with guaranteed transparent stops anchoring 0 and 1.
+const buildPulseGradient = (
+  L: number,
+  phase: number
+): ExpressionSpecification => {
+  const n = Math.max(1, Math.min(PULSE_MAX_ANTS, Math.round(L / PULSE_SPACING_M)));
+  const p = 1 / n; // ant period in line-progress fraction
+  // Guard against overlap on very short selections where width+fade would
+  // exceed the period; the pulse then degrades gracefully instead of throwing.
+  const w = Math.min(PULSE_WIDTH_M / L, p * 0.8);
+  const f = Math.min(PULSE_FADE_M / L, p * 0.4);
+
+  const raw: Array<{ x: number; c: string }> = [
+    { x: 0, c: PULSE_BASE },
+    { x: 1, c: PULSE_BASE },
+  ];
+  for (let k = -1; k <= n; k++) {
+    const c = (k + phase) * p;
+    raw.push({ x: clamp01(c - w / 2 - f), c: PULSE_BASE });
+    raw.push({ x: clamp01(c - w / 2), c: PULSE_PEAK });
+    raw.push({ x: clamp01(c + w / 2), c: PULSE_PEAK });
+    raw.push({ x: clamp01(c + w / 2 + f), c: PULSE_BASE });
+  }
+  raw.sort((a, b) => a.x - b.x);
+
+  const stops: Array<number | string> = [];
+  let prev = -1;
+  for (const s of raw) {
+    if (s.x <= prev) continue;
+    stops.push(s.x, s.c);
+    prev = s.x;
+  }
+  return [
+    "interpolate",
+    ["linear"],
+    ["line-progress"],
+    ...stops,
+  ] as unknown as ExpressionSpecification;
+};
+
 // Return FRESH expression arrays per call: MapLibre mutates expression arrays
 // in place while parsing, so a shared reference reused across paint properties
 // gets corrupted and silently stops reacting to feature-state.
@@ -87,7 +154,7 @@ const LAYER_GROUPS = {
   // naipLayerIdsRef), so the static group is empty.
   naip: [] as string[],
   bounds: ["project-bounds-fill", "project-bounds-outline"],
-  trails: ["trails-casing", "trails-line", "trails-label"],
+  trails: ["trails-casing", "trails-line", "trails-pulse", "trails-label"],
   peaks: ["peaks-circle", "peaks-label"],
   passes: ["passes-circle", "passes-label"],
   water: [
@@ -122,6 +189,13 @@ export default function MapView() {
   // Feature-state "selected" ids most recently pushed to MapLibre, so the
   // styling effect can diff against the new selection and only flip what changed.
   const appliedRef = useRef<Set<number>>(new Set());
+  // Direction-pulse animation: the running rAF handle, the selection's total
+  // ground length (meters, the line-progress denominator), and the current
+  // phase + last frame timestamp so speed is wall-clock based, not per-frame.
+  const pulseRafRef = useRef<number | null>(null);
+  const pulseLengthRef = useRef(0);
+  const pulsePhaseRef = useRef(0);
+  const pulseLastTsRef = useRef(0);
   const [loading, setLoading] = useState(true);
   const [photoOpen, setPhotoOpen] = useState(false);
   const [trails, setTrails] = useState<Array<TrailSelection & { id: number }>>(
@@ -168,6 +242,65 @@ export default function MapView() {
     // trails with the updated "selected" state.
     freeTerrainRtt(map);
     map.triggerRepaint();
+
+    // Direction pulse: rebuild the merged selection LineString and (re)start or
+    // stop the marching-ants animation loop to match the new selection.
+    const stopPulse = () => {
+      if (pulseRafRef.current != null) {
+        cancelAnimationFrame(pulseRafRef.current);
+        pulseRafRef.current = null;
+      }
+    };
+
+    const pulseSource = map.getSource("pulse") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+
+    if (next.size === 0 || !pulseSource) {
+      stopPulse();
+      pulseSource?.setData(EMPTY_FC);
+      return;
+    }
+
+    const { coords, lengthM } = mergedPulseLine(trails);
+    if (coords.length < 2 || lengthM <= 0) {
+      stopPulse();
+      pulseSource.setData(EMPTY_FC);
+      return;
+    }
+
+    pulseSource.setData({
+      type: "Feature",
+      properties: {},
+      geometry: { type: "LineString", coordinates: coords },
+    });
+    pulseLengthRef.current = lengthM;
+
+    // Restart the loop fresh so a selection change doesn't leave two running.
+    stopPulse();
+    pulseLastTsRef.current = 0;
+    const tick = (ts: number) => {
+      if (pulseLastTsRef.current === 0) pulseLastTsRef.current = ts;
+      const dt = (ts - pulseLastTsRef.current) / 1000;
+      pulseLastTsRef.current = ts;
+      pulsePhaseRef.current = (pulsePhaseRef.current + PULSE_SPEED * dt) % 1;
+
+      if (map.getLayer("trails-pulse")) {
+        map.setPaintProperty(
+          "trails-pulse",
+          "line-gradient",
+          buildPulseGradient(pulseLengthRef.current, pulsePhaseRef.current)
+        );
+        // Per-frame paint changes don't invalidate the draped terrain texture
+        // (same RTT quirk as feature-state above), so drop it each frame.
+        freeTerrainRtt(map);
+        map.triggerRepaint();
+      }
+      pulseRafRef.current = requestAnimationFrame(tick);
+    };
+    pulseRafRef.current = requestAnimationFrame(tick);
+
+    return stopPulse;
   }, [trails]);
 
   useEffect(() => {
@@ -414,6 +547,42 @@ export default function MapView() {
           ],
         },
       });
+      // Direction pulse overlay: a single merged LineString of the current
+      // selection, styled with an animated line-gradient (see the selection
+      // effect). lineMetrics is required for line-gradient / line-progress.
+      map.addSource("pulse", {
+        type: "geojson",
+        lineMetrics: true,
+        data: EMPTY_FC,
+      });
+      map.addLayer({
+        id: "trails-pulse",
+        type: "line",
+        source: "pulse",
+        layout: { "line-join": "round", "line-cap": "round" },
+        paint: {
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            10,
+            3.5,
+            16,
+            6.5,
+          ],
+          // Replaced every animation frame; transparent until a selection exists.
+          "line-gradient": [
+            "interpolate",
+            ["linear"],
+            ["line-progress"],
+            0,
+            PULSE_BASE,
+            1,
+            PULSE_BASE,
+          ],
+        },
+      });
+
       map.addLayer({
         id: "trails-label",
         type: "symbol",
