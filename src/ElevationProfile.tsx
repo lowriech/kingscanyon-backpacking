@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
 export type TrailSelection = {
   name: string;
@@ -9,8 +9,28 @@ export type TrailSelection = {
 
 const W = 320;
 const H = 170;
-const PAD = { top: 12, right: 14, bottom: 26, left: 42 };
-const STEP_M = 100; // grey y-axis reference lines every 100 m
+const PAD = { top: 12, right: 14, bottom: 26, left: 48 };
+
+type UnitSystem = "imperial" | "metric";
+
+// Internal geometry is metres; these describe how to display each axis. `step`
+// is the spacing of the grey y-axis reference lines, in the display unit.
+const UNITS: Record<
+  UnitSystem,
+  {
+    elev: { factor: number; step: number; label: string };
+    dist: { factor: number; label: string };
+  }
+> = {
+  imperial: {
+    elev: { factor: 3.28084, step: 500, label: "ft" },
+    dist: { factor: 1 / 1609.344, label: "mi" },
+  },
+  metric: {
+    elev: { factor: 1, step: 100, label: "m" },
+    dist: { factor: 1 / 1000, label: "km" },
+  },
+};
 
 // Endpoint match tolerances for chaining segments (xyz at the ends).
 const EPS_DEG = 1e-5; // ~1 m in lon/lat
@@ -39,10 +59,6 @@ function haversineMeters(a: number[], b: number[]): number {
     Math.sin(dLat / 2) ** 2 +
     Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(h));
-}
-
-function formatDist(m: number): string {
-  return m >= 1000 ? `${(m / 1000).toFixed(2)} km` : `${Math.round(m)} m`;
 }
 
 function samePoint(a: number[], b: number[]): boolean {
@@ -113,7 +129,9 @@ export default function ElevationProfile({
   selections: TrailSelection[];
   onClose: () => void;
 }) {
-  const { plotted, yMin, yMax, xMax } = useMemo(() => {
+  const [unit, setUnit] = useState<UnitSystem>("imperial");
+
+  const { plotted, minE, maxE, xMax } = useMemo(() => {
     const chain = chainSegments(selections);
     const plotted: Plotted[] = [];
     let cursor = 0;
@@ -140,19 +158,36 @@ export default function ElevationProfile({
       cursor += acc;
     }
     const xMax = Math.max(1, cursor);
-    const yMin = Math.floor(minE / STEP_M) * STEP_M;
-    const yMax = Math.max(yMin + STEP_M, Math.ceil(maxE / STEP_M) * STEP_M);
-    return { plotted, yMin, yMax, xMax };
+    return { plotted, minE, maxE, xMax };
   }, [selections]);
+
+  const u = UNITS[unit];
+
+  // Distances are converted from metres; elevations are formatted as whole
+  // numbers in the active unit.
+  const fmtDist = (m: number) =>
+    `${(m * u.dist.factor).toFixed(2)} ${u.dist.label}`;
+  const fmtElev = (m: number) => Math.round(m * u.elev.factor);
 
   const plotW = W - PAD.left - PAD.right;
   const plotH = H - PAD.top - PAD.bottom;
 
+  // Y-axis bounds, in the display unit, snapped to whole `step` increments.
+  const step = u.elev.step;
+  const yMin = Math.floor((minE * u.elev.factor) / step) * step;
+  const yMax = Math.max(
+    yMin + step,
+    Math.ceil((maxE * u.elev.factor) / step) * step,
+  );
+
   const sx = (d: number) => PAD.left + (d / xMax) * plotW;
-  const sy = (e: number) => PAD.top + (1 - (e - yMin) / (yMax - yMin)) * plotH;
+  // syDisp maps an already-converted display elevation; sy converts metres.
+  const syDisp = (e: number) =>
+    PAD.top + (1 - (e - yMin) / (yMax - yMin)) * plotH;
+  const sy = (e: number) => syDisp(e * u.elev.factor);
 
   const refLines: number[] = [];
-  for (let e = yMin; e <= yMax; e += STEP_M) refLines.push(e);
+  for (let e = yMin; e <= yMax; e += step) refLines.push(e);
 
   return (
     <div id="elevation-viewer" className="panel">
@@ -164,6 +199,24 @@ export default function ElevationProfile({
       >
         ×
       </button>
+      <div className="elev-unit-toggle" role="group" aria-label="Units">
+        <button
+          type="button"
+          className={unit === "imperial" ? "active" : ""}
+          aria-pressed={unit === "imperial"}
+          onClick={() => setUnit("imperial")}
+        >
+          mi/ft
+        </button>
+        <button
+          type="button"
+          className={unit === "metric" ? "active" : ""}
+          aria-pressed={unit === "metric"}
+          onClick={() => setUnit("metric")}
+        >
+          km/m
+        </button>
+      </div>
       <svg
         className="elev-graph"
         viewBox={`0 0 ${W} ${H}`}
@@ -174,12 +227,12 @@ export default function ElevationProfile({
           <g key={e}>
             <line
               x1={PAD.left}
-              y1={sy(e)}
+              y1={syDisp(e)}
               x2={PAD.left + plotW}
-              y2={sy(e)}
+              y2={syDisp(e)}
               className="elev-gridline"
             />
-            <text x={PAD.left - 6} y={sy(e) + 3} className="elev-ytick">
+            <text x={PAD.left - 6} y={syDisp(e) + 3} className="elev-ytick">
               {e}
             </text>
           </g>
@@ -203,10 +256,13 @@ export default function ElevationProfile({
           0
         </text>
         <text x={PAD.left + plotW} y={H - 8} className="elev-xtick elev-x-end">
-          {formatDist(xMax)}
+          {fmtDist(xMax)}
         </text>
-        <text x={12} y={PAD.top - 1} className="elev-axis-label">
-          m
+        <text
+          className="elev-axis-label"
+          transform={`translate(7, ${PAD.top + plotH / 2}) rotate(-90)`}
+        >
+          {u.elev.label}
         </text>
       </svg>
 
@@ -219,8 +275,8 @@ export default function ElevationProfile({
             />
             <span className="elev-legend-name">{p.sel.name}</span>
             <span className="elev-legend-stats">
-              {formatDist(p.length)} · ↑{Math.round(p.gain)} ↓
-              {Math.round(p.loss)} m
+              {fmtDist(p.length)} · ↑{fmtElev(p.gain)} ↓
+              {fmtElev(p.loss)} {u.elev.label}
             </span>
           </div>
         ))}

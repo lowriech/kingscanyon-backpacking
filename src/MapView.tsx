@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import type { ExpressionSpecification } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
@@ -28,6 +28,18 @@ const NAIP_ATTRIBUTION = "Imagery &copy; USGS NAIP / The National Map";
 
 // A clicked trail piece is keyed by its Overture id + split index.
 const trailKey = (id: unknown, seg: unknown) => `${id}#${seg}`;
+
+// Free the terrain render-to-texture cache so draped vector layers re-render
+// after a feature-state change. `Map.terrain` and its TerrainSourceCache.freeRtt
+// are internal (not in the public types), hence the structural cast.
+const freeTerrainRtt = (map: maplibregl.Map) => {
+  const terrain = (
+    map as unknown as {
+      terrain?: { sourceCache?: { freeRtt?: () => void } };
+    }
+  ).terrain;
+  terrain?.sourceCache?.freeRtt?.();
+};
 
 const ROUTE_TRAIL_NAMES = [
   "Farewell Gap - Franklin Lakes Trail",
@@ -99,14 +111,22 @@ export default function MapView() {
   // `trails` state for the elevation panel and into feature-state for styling.
   const selectionRef = useRef<Map<number, TrailSelection>>(new Map());
   const hoveredRef = useRef<number | null>(null);
+  // Set when a Shift-drag box select just completed, so the synthetic click
+  // MapLibre fires afterward doesn't also toggle the segment under the cursor.
+  const boxSelectedRef = useRef(false);
   // NAIP overlay layer ids (one raster layer per COG tile from the manifest)
   // and the desired on/off state, mirrored so layers added asynchronously after
   // the manifest loads pick up the latest toggle.
   const naipLayerIdsRef = useRef<string[]>([]);
   const naipVisibleRef = useRef(false);
+  // Feature-state "selected" ids most recently pushed to MapLibre, so the
+  // styling effect can diff against the new selection and only flip what changed.
+  const appliedRef = useRef<Set<number>>(new Set());
   const [loading, setLoading] = useState(true);
   const [photoOpen, setPhotoOpen] = useState(false);
-  const [trails, setTrails] = useState<TrailSelection[]>([]);
+  const [trails, setTrails] = useState<Array<TrailSelection & { id: number }>>(
+    []
+  );
   const [exaggeration, setExaggeration] = useState(DEFAULT_EXAGGERATION);
   const [visible, setVisible] = useState<Record<LayerGroup, boolean>>({
     naip: false,
@@ -116,6 +136,39 @@ export default function MapView() {
     passes: true,
     water: true,
   });
+
+  // Snapshot the (imperatively mutated) selection ref into React state. This is
+  // the single entry point every selection change goes through; the styling
+  // effect below reacts to the resulting state update.
+  const commitSelection = useCallback(() => {
+    setTrails(Array.from(selectionRef.current, ([id, sel]) => ({ id, ...sel })));
+  }, []);
+
+  // Keep MapLibre's "selected" feature-state in lockstep with the selection.
+  // Driving styling from an effect (instead of inline setFeatureState calls in
+  // each handler) guarantees it runs on every selection change, so selected
+  // trails light up immediately rather than lagging until the next pan/zoom.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const next = new Set(trails.map((t) => t.id));
+    const prev = appliedRef.current;
+    for (const id of prev)
+      if (!next.has(id))
+        map.setFeatureState({ source: "trails", id }, { selected: false });
+    for (const id of next)
+      if (!prev.has(id))
+        map.setFeatureState({ source: "trails", id }, { selected: true });
+    appliedRef.current = next;
+
+    // With 3D terrain on, draped layers render to a cached texture that
+    // setFeatureState does NOT invalidate, so the new paint only appears after a
+    // pan/zoom rebuilds the tiles (maplibre-gl-js#6231, fixed after our 4.7.1).
+    // Drop the terrain render-to-texture cache so the next frame re-drapes the
+    // trails with the updated "selected" state.
+    freeTerrainRtt(map);
+    map.triggerRepaint();
+  }, [trails]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -429,6 +482,8 @@ export default function MapView() {
       });
 
       map.on("click", "trails-line", (e) => {
+        // Ignore the click MapLibre emits at the end of a Shift-drag box select.
+        if (boxSelectedRef.current) return;
         const f = e.features?.[0];
         if (f == null || typeof f.id !== "number") return;
         const p = f.properties ?? {};
@@ -446,26 +501,14 @@ export default function MapView() {
 
         if (additive) {
           // Shift-click toggles this segment in/out of the selection.
-          if (picked.has(id)) {
-            picked.delete(id);
-            map.setFeatureState({ source: "trails", id }, { selected: false });
-          } else {
-            picked.set(id, sel);
-            map.setFeatureState({ source: "trails", id }, { selected: true });
-          }
+          if (picked.has(id)) picked.delete(id);
+          else picked.set(id, sel);
         } else {
           // Plain click replaces the selection with just this segment.
-          for (const prev of picked.keys())
-            map.setFeatureState(
-              { source: "trails", id: prev },
-              { selected: false }
-            );
           picked.clear();
           picked.set(id, sel);
-          map.setFeatureState({ source: "trails", id }, { selected: true });
         }
-        map.triggerRepaint();
-        setTrails(Array.from(picked.values()));
+        commitSelection();
       });
 
       // Clicking off any segment (no trail under the cursor) without Shift
@@ -476,14 +519,101 @@ export default function MapView() {
           layers: ["trails-line"],
         });
         if (hits.length > 0) return;
-        for (const prev of selectionRef.current.keys())
-          map.setFeatureState(
-            { source: "trails", id: prev },
-            { selected: false }
-          );
         selectionRef.current.clear();
-        map.triggerRepaint();
-        setTrails([]);
+        commitSelection();
+      });
+
+      // Shift+drag rubber-band: hold Shift to suspend panning and instead sweep
+      // a box that adds every trail segment it touches to the selection. Plain
+      // (sub-threshold) Shift-clicks fall through to the toggle handler above.
+      const canvasContainer = map.getCanvasContainer();
+      const DRAG_THRESHOLD = 4;
+      let boxEl: HTMLDivElement | null = null;
+      let boxStart: maplibregl.Point | null = null;
+
+      const mousePos = (e: MouseEvent): maplibregl.Point => {
+        const rect = canvasContainer.getBoundingClientRect();
+        return new maplibregl.Point(
+          e.clientX - rect.left - canvasContainer.clientLeft,
+          e.clientY - rect.top - canvasContainer.clientTop
+        );
+      };
+
+      const finishBox = () => {
+        document.removeEventListener("mousemove", onBoxMove);
+        document.removeEventListener("mouseup", onBoxUp);
+        if (boxEl) {
+          boxEl.remove();
+          boxEl = null;
+        }
+        // Re-enable panning for the next, non-Shift drag.
+        map.dragPan.enable();
+      };
+
+      const onBoxMove = (e: MouseEvent) => {
+        if (!boxStart) return;
+        const cur = mousePos(e);
+        if (
+          !boxEl &&
+          Math.abs(cur.x - boxStart.x) < DRAG_THRESHOLD &&
+          Math.abs(cur.y - boxStart.y) < DRAG_THRESHOLD
+        )
+          return;
+        if (!boxEl) {
+          boxEl = document.createElement("div");
+          boxEl.className = "boxselect";
+          canvasContainer.appendChild(boxEl);
+        }
+        const minX = Math.min(boxStart.x, cur.x);
+        const minY = Math.min(boxStart.y, cur.y);
+        boxEl.style.transform = `translate(${minX}px, ${minY}px)`;
+        boxEl.style.width = `${Math.abs(cur.x - boxStart.x)}px`;
+        boxEl.style.height = `${Math.abs(cur.y - boxStart.y)}px`;
+      };
+
+      const onBoxUp = (e: MouseEvent) => {
+        const start = boxStart;
+        const drewBox = boxEl != null;
+        boxStart = null;
+        finishBox();
+        if (!start || !drewBox) return;
+
+        const end = mousePos(e);
+        const picked = selectionRef.current;
+        const hits = map.queryRenderedFeatures(
+          [
+            [Math.min(start.x, end.x), Math.min(start.y, end.y)],
+            [Math.max(start.x, end.x), Math.max(start.y, end.y)],
+          ],
+          { layers: ["trails-line"] }
+        );
+        for (const f of hits) {
+          if (typeof f.id !== "number" || picked.has(f.id)) continue;
+          const p = f.properties ?? {};
+          const coords = trailGeomRef.current.get(trailKey(p.id, p.seg));
+          if (!coords || coords.length < 2) continue;
+          picked.set(f.id, {
+            name: p.name ?? "Trail",
+            seg: Number(p.seg) || 0,
+            coords,
+          });
+        }
+        commitSelection();
+
+        // Swallow the click MapLibre fires right after this mouseup.
+        boxSelectedRef.current = true;
+        setTimeout(() => {
+          boxSelectedRef.current = false;
+        }, 0);
+      };
+
+      canvasContainer.addEventListener("mousedown", (e) => {
+        if (!e.shiftKey || e.button !== 0) return;
+        // Take over from MapLibre's drag-to-pan while Shift is held.
+        map.dragPan.disable();
+        boxStart = mousePos(e);
+        document.addEventListener("mousemove", onBoxMove);
+        document.addEventListener("mouseup", onBoxUp);
       });
 
       // Peaks + passes (points with elevation labels)
@@ -632,14 +762,8 @@ export default function MapView() {
   };
 
   const clearSelection = () => {
-    const map = mapRef.current;
-    if (map) {
-      for (const id of selectionRef.current.keys())
-        map.setFeatureState({ source: "trails", id }, { selected: false });
-      map.triggerRepaint();
-    }
     selectionRef.current.clear();
-    setTrails([]);
+    commitSelection();
   };
 
   const flyToMineralKing = () => {
@@ -682,7 +806,8 @@ export default function MapView() {
         <h1>Kings Canyon</h1>
         <p>
           3D elevation terrain over Kings Canyon National Park, California. Drag
-          to pan, right-drag to tilt &amp; rotate, scroll to zoom.
+          to pan, right-drag to tilt &amp; rotate, scroll to zoom. Shift-drag to
+          select trails.
         </p>
       </div>
 

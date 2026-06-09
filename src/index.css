@@ -189,6 +189,19 @@ button.flyto:hover {
   background: rgba(95, 207, 128, 0.22);
 }
 
+/* Shift+drag rubber-band trail selection box */
+.boxselect {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  pointer-events: none;
+  background: rgba(255, 46, 99, 0.12);
+  border: 1.5px solid var(--route-trail);
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
 /* Ranger station marker */
 .ranger-marker {
   width: 16px;
@@ -343,7 +356,41 @@ button.flyto:hover {
 .elev-axis-label {
   fill: var(--muted);
   font-size: 9px;
-  text-anchor: start;
+  text-anchor: middle;
+}
+
+.elev-unit-toggle {
+  display: flex;
+  align-self: flex-start;
+  gap: 0;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.elev-unit-toggle button {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.elev-unit-toggle button + button {
+  border-left: 1px solid var(--panel-border);
+}
+
+.elev-unit-toggle button:hover {
+  color: var(--text);
+}
+
+.elev-unit-toggle button.active {
+  background: rgba(255, 255, 255, 0.16);
+  color: var(--text);
 }
 
 .elev-legend {
